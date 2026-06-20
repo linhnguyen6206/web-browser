@@ -1,5 +1,99 @@
 import tkinter
 import tkinter.font
+import urllib.parse
+import socket
+
+
+ENTRIES = ['Pavel was here']
+
+def show_comments():
+    out = "<!doctype html>\n"
+    for entry in ENTRIES:
+        out += "<p>" + entry + "</p>\n"
+    
+    out += "<form action='/add' method='post'>\n"
+    out += "<p><input name='guest'></p>\n"
+    out += "<p><button>Sign the book!</button></p>\n"
+    out += "</form>"
+    return out
+
+def handle_connection(conx):
+    req = conx.makefile("b")
+    reqline = req.readline().decode('utf8')
+    
+    if not reqline:
+        conx.close()
+        return
+
+    method, url, version = reqline.split(" ", 2)
+    assert method in ["GET", "POST"]
+    
+    headers = {}
+    while True:
+        line = req.readline().decode('utf8')
+        if line == '\r\n': 
+            break
+        header, value = line.split(":", 1)
+        headers[header.casefold()] = value.strip()
+        
+    if 'content-length' in headers:
+        length = int(headers['content-length'])
+        body = req.read(length).decode('utf8')
+    else:
+        body = None
+        
+    status, body = do_request(method, url, headers, body)
+    
+    response = "HTTP/1.0 {}\r\n".format(status)
+    response += "Content-Length: {}\r\n".format(len(body.encode("utf8")))
+    response += "\r\n" + body
+    
+    conx.send(response.encode('utf8'))
+    conx.close()
+
+def do_request(method, url, headers, body):
+    if method == "GET" and url == "/":
+        return "200 OK", show_comments()
+    elif method == "POST" and url == "/add":
+        params = form_decode(body)
+        return "200 OK", add_entry(params)
+    else:
+        return "404 Not Found", not_found(url, method)
+    
+def form_decode(body):
+    params = {}
+    if not body:
+        return params
+    for field in body.split("&"):
+        name, value = field.split("=", 1)
+        name = urllib.parse.unquote_plus(name)
+        value = urllib.parse.unquote_plus(value)
+        params[name] = value
+    return params
+
+def add_entry(params):
+    if 'guest' in params:
+        ENTRIES.append(params['guest'])
+    return show_comments()
+
+def not_found(url, method):
+    out = "<!doctype html>"
+    out += "<h1>{} {} not found!</h1>".format(method, url)
+    return out
+
+if __name__ == "__main__":
+    s = socket.socket(
+        family=socket.AF_INET,
+        type=socket.SOCK_STREAM,
+        proto=socket.IPPROTO_TCP)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(('', 8000))
+    s.listen()
+    print("Server listening on http://localhost:8000 ...")
+    
+    while True:
+        conx, addr = s.accept()
+        handle_connection(conx)
 
 # --- Constants & Globals ---
 HEIGHT, WIDTH = 600, 800
@@ -56,6 +150,7 @@ class Element:
         self.children = []
         self.parent = parent
         self.style = {}
+        self.is_focused = False
 
     def __repr__(self):
         return "<" + self.tag + ">"
@@ -80,10 +175,22 @@ class URL:
         else:
             return URL(self.scheme + "://" + self.host + ":" + str(self.port) + url)
             
-    def request(self):
-        # Placeholder for socket logic
+    def request(self, payload=None, s=None):
+        method = "POST" if payload else "GET"
+        
+        
+        request = "{} {} HTTP/1.0\r\n".format(method, self.path)
+        
+        if payload: 
+            length = len(payload.encode("utf8"))
+            request += "Content-Length: {}\r\n".format(length)
+        
+        request += "\r\n"
+        
+        if payload: 
+            request += payload
+        
         return "<html><body>Hello World</body></html>"
-    
     def __str__(self):
         port_part = ":" + str(self.port)
         if self.scheme == "https" and self.port == 443:
@@ -91,7 +198,7 @@ class URL:
         if self.scheme == "http" and self.port == 80:
             port_part = ""
         return self.scheme + "://" + self.host + port_part + self.path
-# --- Parsers ---
+
 class HTMLParser:
     HEAD_TAGS = [
         "base", "basefont", "bgsound", "noscript", "link",
@@ -367,8 +474,13 @@ class BlockLayout:
     def layout_mode(self):
         if isinstance(self.node, Text): return "inline"
         elif any(isinstance(child, Element) and child.tag in BLOCK_ELEMENTS for child in self.node.children): return "block"
-        elif self.node.children: return "inline"
+        elif self.node.children or self.node.tag == "input":
+            return "inline"
         else: return "block"
+
+    def should_paint(self):
+        return isinstance(self.node, Text) or \
+            (self.node.tag != "input" and self.node.tag != "button")
 
     def layout(self):
         self.x = self.parent.x
@@ -414,7 +526,36 @@ class BlockLayout:
         return Rect(self.x, self.y,
                     self.x + self.width, self.y + self.height)
     
+    def recurse(self, node):
+        if isinstance(node, Text):
+            for word in node.text.split():
+                self.word(node, word)
+        else:
+            if node.tag == "br":
+                self.new_line()
+            elif node.tag == "input" or node.tag == "button":
+                self.input(node)
+            else:
+                for child in node.children:
+                    self.recurse(child)
     
+    def input(self, node):
+        w = INPUT_WIDTH_PX
+        if self.cursor_x + w > self.width:
+            self.new_line()
+        line = self.children[-1]
+        previous_word = line.children[-1] if line.children else None
+        input = InputLayout(node, line, previous_word)
+        line.children.append(input)
+
+        weight = node.style["font-weight"]
+        style = node.style["font-style"]
+        if style == "normal": style = "roman"
+        size = int(float(node.style["font-size"][:-2])* .75)
+        font = get_font(size, weight, style)
+        self.cursor_x += w + font.measure(" ")
+
+
 class LineLayout:
     def __init__(self, node, parent, previous):
         self.node = node
@@ -575,65 +716,114 @@ class Tab:
         self.canvas = tkinter.Canvas(self.window, width=WIDTH, height=HEIGHT, bg="white")
         self.canvas.pack()
         self.window.bind("<Down>", self.scrolldown)
+        self.window.bind("<Button-1>", self.click)
+        
         self.scroll = 0
         self.display_list = []
-        self.window.bind("<Button-1>", self.click)
         self.url = None
         self.tab_height = tab_height
         self.history = []
+        self.focus = None
+        self.nodes = None
+        self.document = None
 
     def click(self, e):
-        x, y = e.x, e.y
-        y += self.scroll
-        objs = [obj for obj in tree_to_list(self.document, [])
-                if obj.x <= x < obj.x + obj.width
-                and obj.y <= y < obj.y + obj.height]
-        if not objs: return
-        elt = objs[-1].node
+        x, y = e.x, e.y + self.scroll 
+        
+        if getattr(self, 'focus', None):
+            self.focus.is_focused = False
+            self.focus = None
+        
+        elt = self.hit_test(x, y) 
+
         while elt:
-            if isinstance(elt, Text):
-                pass
-            elif elt.tag == "a" and "href" in elt.attributes:
-                url = self.url.resolve(elt.attributes["href"])
-                return self.load(url)
-            elt = elt.parent
-    
+            if elt.tag == "button":
+                print("Button clicked")
+                return self.render()
+            
+            elif elt.tag == "input":
+                self.focus = elt
+                elt.is_focused = True
+                return self.render()
+            
+            elt = getattr(elt, 'parent', None)
+
+        return self.render()
+        
     def scrolldown(self, e):
-        max_y = max(self.document.height + 2*VSTEP - self.tab_height, 0)
+        if not self.document: return 
+        
+        max_y = max(self.document.height + 2 * VSTEP - self.tab_height, 0)
         self.scroll = min(self.scroll + SCROLL_STEP, max_y)
+        self.draw()
 
     def draw(self):
         self.canvas.delete("all")
         for cmd in self.display_list:
             if cmd.rect.top > self.scroll + self.tab_height:
                 continue
-            if cmd.rect.bottom < self.scroll: continue
+            if cmd.rect.bottom < self.scroll: 
+                continue
             cmd.execute(self.scroll, self.canvas)
             
-    def load(self, url_str):
-        self.history.append(url)
-        url = URL(url_str)
-        body = url.request() # Note: You'll need to implement the socket request logic in URL
+    def load(self, url_str, payload=None):
+        self.history.append(url_str)
+        self.url = URL(url_str) 
+        
+        body = self.url.request(payload) 
         self.nodes = HTMLParser(body).parse()
         
-        # Apply CSS styling
+        self.render()
+
+    def render(self):
+        if not self.nodes: return
+    
         rules = DEFAULT_STYLE_SHEET.copy()
         apply_style(self.nodes, sorted(rules, key=cascade_priority))
         
-        # Layout
         self.document = DocumentLayout(self.nodes)
         self.document.layout()
         
-        # Paint
         self.display_list = []
         self.document.paint(self.display_list)
-        self.draw()
+        self.draw() 
     
     def go_back(self):
         if len(self.history) > 1:
-            self.history.pop()
-            back = self.history.pop()
+            self.history.pop() 
+            back = self.history.pop() 
             self.load(back)
+
+    def submit_form(self, elt):
+        inputs = self.get_inputs(elt) 
+        
+        body = ""
+        for input_elt in inputs:
+            name = input_elt.attributes.get("name", "")
+            value = getattr(input_elt, "value", input_elt.attributes.get("value", ""))
+        
+            name = urllib.parse.quote(name)
+            value = urllib.parse.quote(value)
+            
+            body += f"&{name}={value}"
+        
+        if body:
+            body = body[1:] 
+            
+        action = elt.attributes.get("action", "")
+        submit_url = self.url.resolve(action) if hasattr(self.url, 'resolve') else action
+        
+        self.load(submit_url, payload=body)
+
+    def get_inputs(self, elt):
+        """Helper method to recursively find all <input> elements in a form."""
+        inputs = []
+        for child in elt.children:
+            if child.tag == "input":
+                inputs.append(child)
+            inputs.extend(self.get_inputs(child))
+        return inputs
+
 
 class Browser:
     def __init__(self):
@@ -655,7 +845,11 @@ class Browser:
         if len(e.char) == 0: return
         if not (0x20 <= ord(e.char) < 0x7f): return
         self.chrome.keypress(e.char)
-        self.draw()
+        if self.chrome.keypress(e.char):
+            self.draw()
+        elif self.focus == "content":
+            self.active_tab.keypress(e.char)
+            self.draw()
 
 
     def handle_down(self, e):
@@ -664,8 +858,11 @@ class Browser:
 
     def handle_click(self, e):
         if e.y < self.chrome.bottom:
+            self.focus = None
             self.chrome.click(e.x, e.y)
         else:
+            self.focus = "content"
+            self.chrome.blur()
             tab_y = e.y - self.chrome.bottom
             self.active_tab.click(e.x, e.y)
         self.draw()
@@ -794,8 +991,9 @@ class Chrome:
                     self.address_bar = ""
 
     def keypress(self, char):
-        if self.focus == "address bar":
-            self.address_bar += char
+        if self.focus:
+            self.focus.attributes["value"] += char
+            self.render()
     
     def enter(self):
         if self.focus == "address bar":
@@ -814,6 +1012,8 @@ class DrawLine:
             self.rect.right, self.rect.bottom - scroll,
             fill=self.color, width=self.thickness)
 
+    def blur(self):
+        self.focus = None
 
 class DrawOutline:
     def __init__(self, rect, color, thickness):
@@ -843,5 +1043,47 @@ if __name__ == "__main__":
     import sys
     Browser().new_tab(URL(sys.argv[1]))
     tkinter.mainloop()
-    
+
+INPUT_WIDTH_PX = 200
+
+class InputLayout:
+    def __init__(self, node, parent, previous):
+        self.node = node
+        self.children = []
+        self.parent = parent
+        self.width = INPUT_WIDTH_PX  
+        self.previous = previous
+        
+
+        self.x = 0
+        self.y = 0
+        self.font = None 
+
+    def paint(self):
+        cmds = []
+        bgcolor = self.node.style.get("background-color", "transparent")
+        text = ""
+        
+        if self.node.tag == "input":
+            text = self.node.attributes.get("value", "")
+        elif self.node.tag == "button":
+            if len(self.node.children) == 1 and isinstance(self.node.children[0], Text):
+                text = self.node.children[0].text
+            else:
+                print("Ignoring HTML contents inside button")
+                text = ""
+        if self.node.is_focused:
+            cx = self.x + self.font.measure(text)
+            cmds.append(DrawLine(
+                cx, self.y, cx, self.y + self.height, "black", ))
+                
+        if bgcolor != "transparent":
+            rect = DrawRect(self.self_rect(), bgcolor)
+            cmds.append(rect)
+            
+        color = self.node.style.get("color", "black") # Added a fallback color
+        
+        cmds.append(DrawText(self.x, self.y, text, self.font, color))
+        
+        return cmds
     
